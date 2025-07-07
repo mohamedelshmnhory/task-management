@@ -9,6 +9,8 @@ public class TodoDb : DbContext
     public DbSet<User> Users { get; set; }
     public DbSet<Project> Projects { get; set; }
     public DbSet<Task> Tasks { get; set; }
+    public DbSet<Comment> Comments { get; set; }
+    public DbSet<Attachment> Attachments { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -44,5 +46,17 @@ public class TodoDb : DbContext
                     .WithMany()
                     .HasForeignKey("ProjectId")
                     .OnDelete(DeleteBehavior.Cascade));
+
+        modelBuilder.Entity<Comment>()
+            .HasOne(c => c.Task)
+            .WithMany(t => t.Comments)
+            .HasForeignKey(c => c.TaskId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<Comment>()
+            .HasOne(c => c.User)
+            .WithMany(u => u.Comments)
+            .HasForeignKey(c => c.UserId)
+            .OnDelete(DeleteBehavior.Cascade);
     }
 }

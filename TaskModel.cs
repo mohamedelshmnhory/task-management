@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Collections.Generic;
 
 /// <summary>
 /// Represents a task belonging to a project and assigned to a user.
@@ -14,6 +15,7 @@ public class Task
     public int? AssignedUserId { get; set; }
     public User? AssignedUser { get; set; }
     public TaskStatus Status { get; set; }
+    public ICollection<Comment> Comments { get; set; }
 }
 
 public enum TaskStatus

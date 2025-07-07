@@ -16,4 +16,5 @@ public class User
     public string? FullName { get; set; }
     public ICollection<Project> Projects { get; set; }
     public ICollection<Task> AssignedTasks { get; set; }
+    public ICollection<Comment> Comments { get; set; }
 } 

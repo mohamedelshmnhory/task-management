@@ -7,6 +7,9 @@ using System.Text;
 using System.Security.Cryptography;
 using Microsoft.Data.SqlClient;
 using System.Text.Json.Serialization;
+using TodoApi;
+using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Logging;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -75,6 +78,13 @@ if (app.Environment.IsDevelopment())
 app.UseAuthentication();
 app.UseAuthorization();
 
+// Add static files middleware to serve uploaded files
+app.UseStaticFiles(new StaticFileOptions
+{
+    FileProvider = new PhysicalFileProvider(Path.Combine(Directory.GetCurrentDirectory(), "uploads")),
+    RequestPath = "/uploads"
+});
+
 // Helper function for hashing passwords
 string HashPassword(string password)
 {
@@ -134,7 +144,7 @@ app.MapPost("/login", async (User login, TodoDb db) =>
         issuer: jwtIssuer,
         audience: null,
         claims: claims,
-        expires: DateTime.UtcNow.AddHours(2),
+        expires: DateTime.UtcNow.AddHours(jwtExpiryHours),
         signingCredentials: creds
     );
     var tokenString = new JwtSecurityTokenHandler().WriteToken(token);
@@ -177,6 +187,8 @@ app.MapGet("/users", async (TodoDb db) =>
 app.MapGet("/projects", async (TodoDb db) => 
     await db.Projects
         .Include(p => p.Owner)
+        .Include(p => p.Tasks)
+        .Include(p => p.Members)
         .Select(p => new 
         {
             p.Id,
@@ -189,7 +201,10 @@ app.MapGet("/projects", async (TodoDb db) =>
                 p.Owner.UserName,
                 p.Owner.Email,
                 p.Owner.FullName
-            }
+            },
+            tasksNumber = p.Tasks.Count(),
+            completedTasksNumber = p.Tasks.Count(t => t.Status == TaskStatus.Done),
+            membersNumber = p.Members.Count()
         })
         .ToListAsync()).RequireAuthorization();
 app.MapGet("/projects/{id}", async (int id, TodoDb db) =>
@@ -261,7 +276,19 @@ app.MapDelete("/projects/{id}", async (int id, TodoDb db) =>
 
 // --- Task Endpoints ---
 app.MapGet("/projects/{projectId}/tasks", async (int projectId, TodoDb db) =>
-    await db.Tasks.Where(t => t.ProjectId == projectId).ToListAsync()).RequireAuthorization();
+    await db.Tasks
+        .Where(t => t.ProjectId == projectId)
+        .Select(t => new {
+            t.Id,
+            t.Title,
+            t.Description,
+            t.ProjectId,
+            t.AssignedUserId,
+            t.Status,
+            AssignedUserName = t.AssignedUser != null ? t.AssignedUser.UserName : null
+        })
+        .ToListAsync()
+).RequireAuthorization();
 app.MapGet("/tasks/{id}", async (int id, TodoDb db) =>
 {
     var task = await db.Tasks
@@ -303,7 +330,7 @@ app.MapPut("/tasks/{id}", async (int id, Task input, TodoDb db) =>
     task.Status = input.Status;
     task.AssignedUserId = input.AssignedUserId;
     await db.SaveChangesAsync();
-    return Results.NoContent();
+    return Results.Ok(task);
 }).RequireAuthorization();
 app.MapDelete("/tasks/{id}", async (int id, TodoDb db) =>
 {
@@ -365,5 +392,275 @@ app.MapDelete("/projects/{id}/members/{userId}", async (int id, int userId, Todo
     await db.SaveChangesAsync();
     return Results.Ok(new ApiResponse(true, "User removed from project"));
 }).RequireAuthorization();
+
+// --- Task Comments Endpoints ---
+app.MapPost("/tasks/{id}/comments", async (int id, ClaimsPrincipal userPrincipal, TodoDb db, CommentInput input) =>
+{
+    var userId = userPrincipal.FindFirstValue(ClaimTypes.NameIdentifier) ?? userPrincipal.FindFirstValue(JwtRegisteredClaimNames.Sub);
+    if (userId == null) return Results.Unauthorized();
+    var task = await db.Tasks.FindAsync(id);
+    if (task == null) return Results.NotFound(new ApiResponse(false, "Task not found"));
+    var user = await db.Users.FindAsync(int.Parse(userId));
+    if (user == null) return Results.Unauthorized();
+    var comment = new Comment
+    {
+        Text = input.Text,
+        TaskId = id,
+        UserId = user.Id,
+        CreatedAt = DateTime.UtcNow
+    };
+    db.Comments.Add(comment);
+    await db.SaveChangesAsync();
+    return Results.Created($"/tasks/{id}/comments/{comment.Id}", new {
+        comment.Id,
+        comment.Text,
+        comment.CreatedAt,
+        User = new {
+            user.Id,
+            user.UserName,
+            user.Email,
+            user.FullName
+        }
+    });
+}).RequireAuthorization();
+
+app.MapGet("/tasks/{id}/comments", async (int id, TodoDb db) =>
+{
+    var comments = await db.Comments
+        .Where(c => c.TaskId == id)
+        .OrderByDescending(c => c.CreatedAt)
+        .Select(c => new {
+            c.Id,
+            c.Text,
+            c.CreatedAt,
+            User = new {
+                c.User.Id,
+                c.User.UserName,
+                c.User.Email,
+                c.User.FullName
+            }
+        })
+        .ToListAsync();
+    return Results.Ok(comments);
+}).RequireAuthorization();
+
+app.MapDelete("/tasks/{taskId}/comments/{commentId}", async (int taskId, int commentId, TodoDb db) =>
+{
+    var comment = await db.Comments.FindAsync(commentId);
+    if (comment == null || comment.TaskId != taskId)
+        return Results.NotFound(new ApiResponse(false, "Comment not found"));
+    
+    db.Comments.Remove(comment);
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapGet("/my-tasks", async (ClaimsPrincipal userPrincipal, TodoDb db) =>
+{
+    var userId = userPrincipal.FindFirstValue(ClaimTypes.NameIdentifier) ?? userPrincipal.FindFirstValue(JwtRegisteredClaimNames.Sub);
+    if (userId == null) return Results.Unauthorized();
+
+    var tasks = await db.Tasks
+        .Where(t => t.AssignedUserId == int.Parse(userId))
+        .Select(t => new {
+            t.Id,
+            t.Title,
+            t.Description,
+            t.ProjectId,
+            t.AssignedUserId,
+            t.Status,
+            AssignedUserName = t.AssignedUser != null ? t.AssignedUser.UserName : null
+        })
+        .ToListAsync();
+
+    return Results.Ok(tasks);
+}).RequireAuthorization();
+
+// --- Task Attachments Endpoints ---
+app.MapPost("/tasks/{id}/attachments", async (int id, HttpRequest request, TodoDb db) =>
+{
+    var task = await db.Tasks.FindAsync(id);
+    if (task == null)
+        return Results.NotFound(new ApiResponse(false, "Task not found"));
+
+    if (!request.HasFormContentType)
+        return Results.BadRequest(new ApiResponse(false, "No file uploaded"));
+
+    var form = await request.ReadFormAsync();
+    var file = form.Files.FirstOrDefault();
+    if (file == null || file.Length == 0)
+        return Results.BadRequest(new ApiResponse(false, "No file uploaded"));
+
+    // Create uploads directory if it doesn't exist
+    var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "uploads", "tasks", id.ToString());
+    Directory.CreateDirectory(uploadsDir);
+
+    var fileName = $"{Guid.NewGuid()}_{Path.GetFileName(file.FileName)}";
+    var filePath = Path.Combine(uploadsDir, fileName);
+
+    using (var stream = new FileStream(filePath, FileMode.Create))
+    {
+        await file.CopyToAsync(stream);
+    }
+
+    var attachment = new Attachment
+    {
+        TaskId = id,
+        FileName = file.FileName,
+        FilePath = filePath,
+        UploadedAt = DateTime.UtcNow
+    };
+    db.Attachments.Add(attachment);
+    await db.SaveChangesAsync();
+
+    // Generate proper URL for the attachment
+    var baseUrl = $"{request.Scheme}://{request.Host}";
+    var downloadUrl = $"{baseUrl}/files/{attachment.Id}";
+
+    return Results.Created($"/tasks/{id}/attachments/{attachment.Id}", new
+    {
+        attachment.Id,
+        attachment.FileName,
+        attachment.UploadedAt,
+        Url = downloadUrl
+    });
+}).RequireAuthorization();
+
+app.MapGet("/tasks/{id}/attachments", async (HttpRequest request, int id, TodoDb db) =>
+{
+    var baseUrl = $"{request.Scheme}://{request.Host}";
+    var attachments = await db.Attachments
+        .Where(a => a.TaskId == id)
+        .Select(a => new
+        {
+            a.Id,
+            a.FileName,
+            a.UploadedAt,
+            Url = $"{baseUrl}/files/{a.Id}"
+        })
+        .ToListAsync();
+
+    return Results.Ok(attachments);
+}).RequireAuthorization();
+
+// Dedicated file serving endpoint
+app.MapGet("/api/attachments/{attachmentId}/download", async (int attachmentId, TodoDb db, ILogger<Program> logger) =>
+{
+    var attachment = await db.Attachments.FirstOrDefaultAsync(a => a.Id == attachmentId);
+    if (attachment == null)
+    {
+        logger.LogWarning("Attachment not found: {AttachmentId}", attachmentId);
+        return Results.NotFound(new ApiResponse(false, "Attachment not found"));
+    }
+
+    if (!File.Exists(attachment.FilePath))
+    {
+        logger.LogError("File not found on disk: {FilePath}", attachment.FilePath);
+        return Results.NotFound(new ApiResponse(false, "File not found on disk"));
+    }
+
+    try
+    {
+        var fileBytes = await File.ReadAllBytesAsync(attachment.FilePath);
+        logger.LogInformation("Serving file: {FileName}, Size: {Size} bytes", attachment.FileName, fileBytes.Length);
+
+        // Determine content type based on file extension
+        var ext = Path.GetExtension(attachment.FileName).ToLowerInvariant();
+        var contentType = ext switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".bmp" => "image/bmp",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".pdf" => "application/pdf",
+            ".txt" => "text/plain",
+            ".doc" => "application/msword",
+            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xls" => "application/vnd.ms-excel",
+            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".ppt" => "application/vnd.ms-powerpoint",
+            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".zip" => "application/zip",
+            ".rar" => "application/x-rar-compressed",
+            ".mp4" => "video/mp4",
+            ".avi" => "video/x-msvideo",
+            ".mov" => "video/quicktime",
+            ".mp3" => "audio/mpeg",
+            ".wav" => "audio/wav",
+            _ => "application/octet-stream"
+        };
+
+        logger.LogInformation("Content-Type: {ContentType} for file: {FileName}", contentType, attachment.FileName);
+        
+        return Results.File(fileBytes, contentType, attachment.FileName);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error serving file: {FileName}", attachment.FileName);
+        return Results.StatusCode(500);
+    }
+}).RequireAuthorization();
+
+// Public file serving endpoint (no authentication required for testing)
+app.MapGet("/files/{attachmentId}", async (int attachmentId, TodoDb db, ILogger<Program> logger) =>
+{
+    var attachment = await db.Attachments.FirstOrDefaultAsync(a => a.Id == attachmentId);
+    if (attachment == null)
+    {
+        logger.LogWarning("Attachment not found: {AttachmentId}", attachmentId);
+        return Results.NotFound("File not found");
+    }
+
+    if (!File.Exists(attachment.FilePath))
+    {
+        logger.LogError("File not found on disk: {FilePath}", attachment.FilePath);
+        return Results.NotFound("File not found on disk");
+    }
+
+    try
+    {
+        var fileBytes = await File.ReadAllBytesAsync(attachment.FilePath);
+        logger.LogInformation("Serving file: {FileName}, Size: {Size} bytes", attachment.FileName, fileBytes.Length);
+
+        // Determine content type based on file extension
+        var ext = Path.GetExtension(attachment.FileName).ToLowerInvariant();
+        var contentType = ext switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".bmp" => "image/bmp",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".pdf" => "application/pdf",
+            ".txt" => "text/plain",
+            ".doc" => "application/msword",
+            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xls" => "application/vnd.ms-excel",
+            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".ppt" => "application/vnd.ms-powerpoint",
+            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".zip" => "application/zip",
+            ".rar" => "application/x-rar-compressed",
+            ".mp4" => "video/mp4",
+            ".avi" => "video/x-msvideo",
+            ".mov" => "video/quicktime",
+            ".mp3" => "audio/mpeg",
+            ".wav" => "audio/wav",
+            _ => "application/octet-stream"
+        };
+
+        logger.LogInformation("Content-Type: {ContentType} for file: {FileName}", contentType, attachment.FileName);
+        
+        return Results.File(fileBytes, contentType, attachment.FileName);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error serving file: {FileName}", attachment.FileName);
+        return Results.StatusCode(500);
+    }
+});
 
 app.Run();
