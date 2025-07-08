@@ -29,10 +29,10 @@ var jwtIssuer = jwtSettings["Issuer"] ?? "TodoApi";
 var jwtExpiryHours = int.Parse(jwtSettings["ExpiryInHours"] ?? "2");
 
 // Get connection string from configuration
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");
 
-builder.Services.AddDbContext<TodoDb>(opt => 
+builder.Services.AddDbContext<TodoDb>(opt =>
     opt.UseSqlServer(connectionString));
 
 builder.Services.AddDatabaseDeveloperPageExceptionFilter();
@@ -62,6 +62,19 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
+
+
+// Serve static files from wwwroot and .well-known
+app.UseStaticFiles(); // For wwwroot
+
+// Serve .well-known directory
+app.UseStaticFiles(new StaticFileOptions
+{
+    FileProvider = new PhysicalFileProvider(
+        Path.Combine(Directory.GetCurrentDirectory(), ".well-known")),
+    RequestPath = "/.well-known",
+    ServeUnknownFileTypes = true // Needed for files without extensions
+});
 
 if (app.Environment.IsDevelopment())
 {
@@ -130,7 +143,7 @@ app.MapPost("/login", async (User login, TodoDb db) =>
 {
     var hashed = HashPassword(login.PasswordHash);
     var user = await db.Users.FirstOrDefaultAsync(u => u.UserName == login.UserName && u.PasswordHash == hashed);
-    if (user == null) 
+    if (user == null)
         return Results.Json(new ApiResponse(false, "Invalid username or password."), statusCode: 400);
     var claims = new[]
     {
@@ -174,7 +187,8 @@ app.MapPut("/profile", async (ClaimsPrincipal userPrincipal, User input, TodoDb 
 
 app.MapGet("/users", async (TodoDb db) =>
     await db.Users
-        .Select(u => new {
+        .Select(u => new
+        {
             u.Id,
             u.UserName,
             u.Email,
@@ -184,18 +198,18 @@ app.MapGet("/users", async (TodoDb db) =>
 ).RequireAuthorization();
 
 // --- Project Endpoints ---
-app.MapGet("/projects", async (TodoDb db) => 
+app.MapGet("/projects", async (TodoDb db) =>
     await db.Projects
         .Include(p => p.Owner)
         .Include(p => p.Tasks)
         .Include(p => p.Members)
-        .Select(p => new 
+        .Select(p => new
         {
             p.Id,
             p.Name,
             p.Description,
             p.OwnerId,
-            Owner = new 
+            Owner = new
             {
                 p.Owner.Id,
                 p.Owner.UserName,
@@ -235,7 +249,7 @@ app.MapGet("/projects/{id}", async (int id, TodoDb db) =>
                 t.AssignedUserId,
                 t.Status
             }),
-            Members = p.Members.Select(u => new 
+            Members = p.Members.Select(u => new
             {
                 u.Id,
                 u.UserName,
@@ -244,7 +258,7 @@ app.MapGet("/projects/{id}", async (int id, TodoDb db) =>
             })
         })
         .FirstOrDefaultAsync();
-    
+
     return project != null ? Results.Ok(project) : Results.NotFound();
 }).RequireAuthorization();
 app.MapPost("/projects", async (ClaimsPrincipal userPrincipal, Project project, TodoDb db) =>
@@ -278,7 +292,8 @@ app.MapDelete("/projects/{id}", async (int id, TodoDb db) =>
 app.MapGet("/projects/{projectId}/tasks", async (int projectId, TodoDb db) =>
     await db.Tasks
         .Where(t => t.ProjectId == projectId)
-        .Select(t => new {
+        .Select(t => new
+        {
             t.Id,
             t.Title,
             t.Description,
@@ -294,7 +309,7 @@ app.MapGet("/tasks/{id}", async (int id, TodoDb db) =>
     var task = await db.Tasks
         .Include(t => t.AssignedUser)
         .Where(t => t.Id == id)
-        .Select(t => new 
+        .Select(t => new
         {
             t.Id,
             t.Title,
@@ -302,7 +317,7 @@ app.MapGet("/tasks/{id}", async (int id, TodoDb db) =>
             t.ProjectId,
             t.AssignedUserId,
             t.Status,
-            AssignedUser = t.AssignedUser != null ? new 
+            AssignedUser = t.AssignedUser != null ? new
             {
                 t.AssignedUser.Id,
                 t.AssignedUser.UserName,
@@ -311,7 +326,7 @@ app.MapGet("/tasks/{id}", async (int id, TodoDb db) =>
             } : null
         })
         .FirstOrDefaultAsync();
-    
+
     return task != null ? Results.Ok(task) : Results.NotFound();
 }).RequireAuthorization();
 app.MapPost("/projects/{projectId}/tasks", async (int projectId, Task task, TodoDb db) =>
@@ -351,7 +366,8 @@ app.MapGet("/projects/{id}/members", async (int id, TodoDb db) =>
     if (project == null)
         return Results.NotFound(new ApiResponse(false, "Project not found"));
 
-    var members = project.Members.Select(u => new {
+    var members = project.Members.Select(u => new
+    {
         u.Id,
         u.UserName,
         u.Email,
@@ -411,11 +427,13 @@ app.MapPost("/tasks/{id}/comments", async (int id, ClaimsPrincipal userPrincipal
     };
     db.Comments.Add(comment);
     await db.SaveChangesAsync();
-    return Results.Created($"/tasks/{id}/comments/{comment.Id}", new {
+    return Results.Created($"/tasks/{id}/comments/{comment.Id}", new
+    {
         comment.Id,
         comment.Text,
         comment.CreatedAt,
-        User = new {
+        User = new
+        {
             user.Id,
             user.UserName,
             user.Email,
@@ -429,11 +447,13 @@ app.MapGet("/tasks/{id}/comments", async (int id, TodoDb db) =>
     var comments = await db.Comments
         .Where(c => c.TaskId == id)
         .OrderByDescending(c => c.CreatedAt)
-        .Select(c => new {
+        .Select(c => new
+        {
             c.Id,
             c.Text,
             c.CreatedAt,
-            User = new {
+            User = new
+            {
                 c.User.Id,
                 c.User.UserName,
                 c.User.Email,
@@ -449,7 +469,7 @@ app.MapDelete("/tasks/{taskId}/comments/{commentId}", async (int taskId, int com
     var comment = await db.Comments.FindAsync(commentId);
     if (comment == null || comment.TaskId != taskId)
         return Results.NotFound(new ApiResponse(false, "Comment not found"));
-    
+
     db.Comments.Remove(comment);
     await db.SaveChangesAsync();
     return Results.NoContent();
@@ -462,7 +482,8 @@ app.MapGet("/my-tasks", async (ClaimsPrincipal userPrincipal, TodoDb db) =>
 
     var tasks = await db.Tasks
         .Where(t => t.AssignedUserId == int.Parse(userId))
-        .Select(t => new {
+        .Select(t => new
+        {
             t.Id,
             t.Title,
             t.Description,
@@ -593,7 +614,7 @@ app.MapGet("/api/attachments/{attachmentId}/download", async (int attachmentId, 
         };
 
         logger.LogInformation("Content-Type: {ContentType} for file: {FileName}", contentType, attachment.FileName);
-        
+
         return Results.File(fileBytes, contentType, attachment.FileName);
     }
     catch (Exception ex)
@@ -653,7 +674,7 @@ app.MapGet("/files/{attachmentId}", async (int attachmentId, TodoDb db, ILogger<
         };
 
         logger.LogInformation("Content-Type: {ContentType} for file: {FileName}", contentType, attachment.FileName);
-        
+
         return Results.File(fileBytes, contentType, attachment.FileName);
     }
     catch (Exception ex)
